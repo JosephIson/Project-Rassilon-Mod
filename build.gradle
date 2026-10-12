@@ -1,0 +1,223 @@
+// =====================================================================
+//  Project Rassilon - build script (NeoForge ModDevGradle, MC 1.21.1)
+// =====================================================================
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+
+plugins {
+    id 'java-library'
+    id 'idea'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+
+// ---------------------------------------------------------------------
+//  Versioning: v<major>.<minor>.<build_number>
+// ---------------------------------------------------------------------
+def versionMajor = project.version_major as int
+def versionMinor = project.version_minor as int
+def buildNumber  = project.build_number as int
+
+version = "${versionMajor}.${versionMinor}.${buildNumber}"
+group = project.mod_group_id
+
+base {
+    // Final artifact: Rassilon-1.21.1-v0.1.1.jar
+    archivesName = "Rassilon-${project.minecraft_version}"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+// Jar file name uses a "v" prefix: Rassilon-1.21.1-v0.1.1.jar
+tasks.named('jar', Jar) {
+    archiveVersion = "v${project.version}"
+    manifest {
+        attributes([
+            'Specification-Title'     : project.mod_id,
+            'Specification-Vendor'    : project.mod_authors,
+            'Specification-Version'   : '1',
+            'Implementation-Title'    : project.mod_full_name,
+            'Implementation-Version'  : project.version,
+            'Implementation-Vendor'   : project.mod_authors,
+            'Rassilon-Build-Number'   : buildNumber,
+        ])
+    }
+}
+tasks.named('sourcesJar', Jar) {
+    archiveVersion = "v${project.version}"
+}
+
+repositories {
+    mavenLocal()
+    maven {
+        name = 'GeckoLib'
+        url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'
+        content { includeGroup 'software.bernie.geckolib' }
+    }
+}
+
+neoForge {
+    version = project.neo_version
+
+    runs {
+        client {
+            client()
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+        server {
+            server()
+            programArgument '--nogui'
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+        gameTestServer {
+            type = 'gameTestServer'
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+        data {
+            data()
+            programArguments.addAll '--mod', project.mod_id, '--all',
+                    '--output', file('src/generated/resources/').getAbsolutePath(),
+                    '--existing', file('src/main/resources/').getAbsolutePath()
+        }
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+    }
+
+    mods {
+        "${project.mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    implementation "software.bernie.geckolib:geckolib-neoforge-${project.minecraft_version}:${project.geckolib_version}"
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+}
+
+// ---------------------------------------------------------------------
+//  neoforge.mods.toml generation from src/main/templates
+// ---------------------------------------------------------------------
+def generateModMetadata = tasks.register('generateModMetadata', ProcessResources) {
+    def replaceProperties = [
+        minecraft_version      : project.minecraft_version,
+        minecraft_version_range: project.minecraft_version_range,
+        neo_version            : project.neo_version,
+        neo_version_range      : project.neo_version_range,
+        loader_version_range   : project.loader_version_range,
+        geckolib_version_range : project.geckolib_version_range,
+        mod_id                 : project.mod_id,
+        mod_name               : project.mod_full_name,
+        mod_license            : project.mod_license,
+        mod_version            : project.version,
+        mod_authors            : project.mod_authors,
+        mod_description        : project.mod_description,
+    ]
+    inputs.properties replaceProperties
+    expand replaceProperties
+    from 'src/main/templates'
+    into 'build/generated/sources/modMetadata'
+}
+sourceSets.main.resources.srcDir generateModMetadata
+neoForge.ideSyncTask generateModMetadata
+
+// ---------------------------------------------------------------------
+//  Automatic build-number incrementation
+// ---------------------------------------------------------------------
+//  After every successful `gradlew build` or `gradlew jar` this task
+//  rewrites build_number in gradle.properties to build_number + 1.
+//
+//  - The jar produced by the current run keeps the number that was read
+//    at configuration time; the NEXT run produces the next number.
+//  - It runs once per invocation, even when both `build` and `jar` are
+//    requested, and only after `build` when both are in the graph.
+//  - It is skipped if any task in the graph failed (e.g. tests during
+//    `build`), so a broken build never burns a number.
+//  - The file is rewritten line by line (comments and ordering are kept)
+//    into a temp file that is then moved over the original atomically.
+//  - Pass -Prassilon.noIncrement=true (e.g. on CI release re-runs) to
+//    skip it.
+// ---------------------------------------------------------------------
+def incrementBuildNumber = tasks.register('incrementBuildNumber') {
+    group = 'versioning'
+    description = 'Increments build_number in gradle.properties after a successful build.'
+
+    def propsFile = rootProject.file('gradle.properties')
+    def mcVersion = project.minecraft_version
+    def skip = project.findProperty('rassilon.noIncrement')?.toString()?.toBoolean() ?: false
+
+    onlyIf('-Prassilon.noIncrement is not set') { !skip }
+    onlyIf('no task in this build failed') {
+        gradle.taskGraph.allTasks.every { it.state.failure == null }
+    }
+
+    doLast {
+        def path = propsFile.toPath()
+        def lines = Files.readAllLines(path, StandardCharsets.UTF_8)
+        def pattern = ~/^(\s*build_number\s*[=:]\s*)(\d+)(\s*)$/
+        int found = 0
+        int oldValue = -1
+        int newValue = -1
+
+        def rewritten = lines.collect { String line ->
+            def m = pattern.matcher(line)
+            if (m.matches()) {
+                found++
+                oldValue = m.group(2) as int
+                newValue = oldValue + 1
+                return "${m.group(1)}${newValue}${m.group(3)}".toString()
+            }
+            return line
+        }
+
+        if (found != 1) {
+            throw new GradleException("incrementBuildNumber: expected exactly one 'build_number=' line in ${propsFile}, found ${found}")
+        }
+
+        def tmp = Files.createTempFile(path.parent, 'gradle.properties', '.tmp')
+        try {
+            Files.write(tmp, rewritten, StandardCharsets.UTF_8)
+            try {
+                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+        logger.lifecycle("[Rassilon] Build number ${oldValue} -> ${newValue} (next jar: Rassilon-${mcVersion}-v${versionMajor}.${versionMinor}.${newValue}.jar)")
+    }
+}
+
+tasks.named('jar') { finalizedBy incrementBuildNumber }
+tasks.named('build') { finalizedBy incrementBuildNumber }
+incrementBuildNumber.configure { mustRunAfter tasks.named('build'), tasks.named('jar') }
+
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}
